@@ -34,7 +34,7 @@
 #include "decode.h"
 #include "h264_parse.h"
 #include "hevc_parse.h"
-#include "hwaccel.h"
+#include "hwconfig.h"
 #include "internal.h"
 #include "mediacodec_wrapper.h"
 #include "mediacodecdec_common.h"
@@ -48,6 +48,7 @@ typedef struct MediaCodecH264DecContext {
     AVPacket buffered_pkt;
 
     int delay_flush;
+    int amlogic_mpeg2_api23_workaround;
 
 } MediaCodecH264DecContext;
 
@@ -166,8 +167,11 @@ static int h264_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
         ff_AMediaFormat_setBuffer(format, "csd-1", (void*)data, data_size);
         av_freep(&data);
     } else {
-        av_log(avctx, AV_LOG_ERROR, "Could not extract PPS/SPS from extradata");
-        ret = AVERROR_INVALIDDATA;
+        const int warn = is_avc && (avctx->codec_tag == MKTAG('a','v','c','1') ||
+                                    avctx->codec_tag == MKTAG('a','v','c','2'));
+        av_log(avctx, warn ? AV_LOG_WARNING : AV_LOG_DEBUG,
+               "Could not extract PPS/SPS from extradata\n");
+        ret = 0;
     }
 
 done:
@@ -253,8 +257,10 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 
         av_freep(&data);
     } else {
-        av_log(avctx, AV_LOG_ERROR, "Could not extract VPS/PPS/SPS from extradata");
-        ret = AVERROR_INVALIDDATA;
+        const int warn = is_nalff && avctx->codec_tag == MKTAG('h','v','c','1');
+        av_log(avctx, warn ? AV_LOG_WARNING : AV_LOG_DEBUG,
+               "Could not extract VPS/PPS/SPS from extradata\n");
+        ret = 0;
     }
 
 done:
@@ -287,6 +293,7 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 {
     int ret;
+    int sdk_int;
 
     const char *codec_mime = NULL;
 
@@ -377,7 +384,17 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         goto done;
     }
 
-    av_log(avctx, AV_LOG_INFO, "MediaCodec started successfully, ret = %d\n", ret);
+    av_log(avctx, AV_LOG_INFO,
+           "MediaCodec started successfully: codec = %s, ret = %d\n",
+           s->ctx->codec_name, ret);
+
+    sdk_int = ff_Build_SDK_INT(avctx);
+    if (sdk_int <= 23 &&
+        strcmp(s->ctx->codec_name, "OMX.amlogic.mpeg2.decoder.awesome") == 0) {
+        av_log(avctx, AV_LOG_INFO, "Enabling workaround for %s on API=%d\n",
+               s->ctx->codec_name, sdk_int);
+        s->amlogic_mpeg2_api23_workaround = 1;
+    }
 
 done:
     if (format) {
@@ -391,82 +408,78 @@ done:
     return ret;
 }
 
-static int mediacodec_send_receive(AVCodecContext *avctx,
-                                   MediaCodecH264DecContext *s,
-                                   AVFrame *frame, bool wait)
-{
-    int ret;
-
-    /* send any pending data from buffered packet */
-    while (s->buffered_pkt.size) {
-        ret = ff_mediacodec_dec_send(avctx, s->ctx, &s->buffered_pkt);
-        if (ret == AVERROR(EAGAIN))
-            break;
-        else if (ret < 0)
-            return ret;
-        s->buffered_pkt.size -= ret;
-        s->buffered_pkt.data += ret;
-        if (s->buffered_pkt.size <= 0)
-            av_packet_unref(&s->buffered_pkt);
-    }
-
-    /* check for new frame */
-    return ff_mediacodec_dec_receive(avctx, s->ctx, frame, wait);
-}
-
 static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
     int ret;
+    ssize_t index;
 
-    /*
-     * MediaCodec.flush() discards both input and output buffers, thus we
-     * need to delay the call to this function until the user has released or
-     * renderered the frames he retains.
-     *
-     * After we have buffered an input packet, check if the codec is in the
-     * flushing state. If it is, we need to call ff_mediacodec_dec_flush.
-     *
-     * ff_mediacodec_dec_flush returns 0 if the flush cannot be performed on
-     * the codec (because the user retains frames). The codec stays in the
-     * flushing state.
-     *
-     * ff_mediacodec_dec_flush returns 1 if the flush can actually be
-     * performed on the codec. The codec leaves the flushing state and can
-     * process again packets.
-     *
-     * ff_mediacodec_dec_flush returns a negative value if an error has
-     * occurred.
-     *
-     */
-    if (ff_mediacodec_dec_is_flushing(avctx, s->ctx)) {
+    /* In delay_flush mode, wait until the user has released or rendered
+       all retained frames. */
+    if (s->delay_flush && ff_mediacodec_dec_is_flushing(avctx, s->ctx)) {
         if (!ff_mediacodec_dec_flush(avctx, s->ctx)) {
             return AVERROR(EAGAIN);
         }
     }
 
-    /* flush buffered packet and check for new frame */
-    ret = mediacodec_send_receive(avctx, s, frame, false);
+    /* poll for new frame */
+    ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, false);
     if (ret != AVERROR(EAGAIN))
         return ret;
 
-    /* skip fetching new packet if we still have one buffered */
-    if (s->buffered_pkt.size > 0)
-        return mediacodec_send_receive(avctx, s, frame, true);
+    /* feed decoder */
+    while (1) {
+        if (s->ctx->current_input_buffer < 0) {
+            /* poll for input space */
+            index = ff_AMediaCodec_dequeueInputBuffer(s->ctx->codec, 0);
+            if (index < 0) {
+                /* no space, block for an output frame to appear */
+                return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+            }
+            s->ctx->current_input_buffer = index;
+        }
 
-    /* fetch new packet or eof */
-    ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
-    if (ret == AVERROR_EOF) {
-        AVPacket null_pkt = { 0 };
-        ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt);
-        if (ret < 0)
+        /* try to flush any buffered packet data */
+        if (s->buffered_pkt.size > 0) {
+            ret = ff_mediacodec_dec_send(avctx, s->ctx, &s->buffered_pkt, false);
+            if (ret >= 0) {
+                s->buffered_pkt.size -= ret;
+                s->buffered_pkt.data += ret;
+                if (s->buffered_pkt.size <= 0) {
+                    av_packet_unref(&s->buffered_pkt);
+                } else {
+                    av_log(avctx, AV_LOG_WARNING,
+                           "could not send entire packet in single input buffer (%d < %d)\n",
+                           ret, s->buffered_pkt.size+ret);
+                }
+            } else if (ret < 0 && ret != AVERROR(EAGAIN)) {
+                return ret;
+            }
+
+            if (s->amlogic_mpeg2_api23_workaround && s->buffered_pkt.size <= 0) {
+                /* fallthrough to fetch next packet regardless of input buffer space */
+            } else {
+                /* poll for space again */
+                continue;
+            }
+        }
+
+        /* fetch new packet or eof */
+        ret = ff_decode_get_packet(avctx, &s->buffered_pkt);
+        if (ret == AVERROR_EOF) {
+            AVPacket null_pkt = { 0 };
+            ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
+            if (ret < 0)
+                return ret;
+            return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+        } else if (ret == AVERROR(EAGAIN) && s->ctx->current_input_buffer < 0) {
+            return ff_mediacodec_dec_receive(avctx, s->ctx, frame, true);
+        } else if (ret < 0) {
             return ret;
+        }
     }
-    else if (ret < 0)
-        return ret;
 
-    /* crank decoder with new packet */
-    return mediacodec_send_receive(avctx, s, frame, true);
+    return AVERROR(EAGAIN);
 }
 
 static void mediacodec_decode_flush(AVCodecContext *avctx)
@@ -478,7 +491,7 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
     ff_mediacodec_dec_flush(avctx, s->ctx);
 }
 
-static const AVCodecHWConfigInternal *mediacodec_hw_configs[] = {
+static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
     &(const AVCodecHWConfigInternal) {
         .public          = {
             .pix_fmt     = AV_PIX_FMT_MEDIACODEC,

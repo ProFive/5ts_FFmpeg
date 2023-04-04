@@ -41,6 +41,8 @@
 #define NBIT_VO_TYPE             5
 #define ARTS_VO_TYPE            10
 #define ACE_VO_TYPE             12
+#define SIMPLE_STUDIO_VO_TYPE   14
+#define CORE_STUDIO_VO_TYPE     15
 #define ADV_SIMPLE_VO_TYPE      17
 
 #define VOT_VIDEO_ID 1
@@ -113,10 +115,6 @@ typedef struct Mpeg4DecContext {
     int cplx_estimation_trash_p;
     int cplx_estimation_trash_b;
 
-    VLC studio_intra_tab[12];
-    VLC studio_luma_dc;
-    VLC studio_chroma_dc;
-
     int rgb;
 } Mpeg4DecContext;
 
@@ -136,7 +134,7 @@ extern RLTable ff_mpeg4_rl_intra;
 extern RLTable ff_rvlc_rl_inter;
 extern RLTable ff_rvlc_rl_intra;
 
-extern const uint16_t ff_sprite_trajectory_tab[15][2];
+extern const uint8_t ff_sprite_trajectory_lens[15];
 extern const uint8_t ff_mb_type_b_tab[4][2];
 
 /* these matrixes will be permuted for the idct */
@@ -149,9 +147,9 @@ extern const uint16_t ff_mpeg4_resync_prefix[8];
 
 extern const uint8_t ff_mpeg4_dc_threshold[8];
 
-extern const uint16_t ff_mpeg4_studio_dc_luma[19][2];
-extern const uint16_t ff_mpeg4_studio_dc_chroma[19][2];
-extern const uint16_t ff_mpeg4_studio_intra[12][22][2];
+extern const uint8_t ff_mpeg4_studio_dc_luma[19][2];
+extern const uint8_t ff_mpeg4_studio_dc_chroma[19][2];
+extern const uint8_t ff_mpeg4_studio_intra[12][24][2];
 
 void ff_mpeg4_encode_mb(MpegEncContext *s,
                         int16_t block[6][64],
@@ -161,7 +159,7 @@ void ff_mpeg4_pred_ac(MpegEncContext *s, int16_t *block, int n,
 void ff_set_mpeg4_time(MpegEncContext *s);
 int ff_mpeg4_encode_picture_header(MpegEncContext *s, int picture_number);
 
-int ff_mpeg4_decode_picture_header(Mpeg4DecContext *ctx, GetBitContext *gb);
+int ff_mpeg4_decode_picture_header(Mpeg4DecContext *ctx, GetBitContext *gb, int header);
 void ff_mpeg4_encode_video_packet_header(MpegEncContext *s);
 void ff_mpeg4_clean_buffers(MpegEncContext *s);
 void ff_mpeg4_stuffing(PutBitContext *pbc);

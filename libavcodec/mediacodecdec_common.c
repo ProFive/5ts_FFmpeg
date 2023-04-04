@@ -86,6 +86,85 @@
 #define OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US 1000000
 
 enum {
+    COLOR_RANGE_FULL    = 0x1,
+    COLOR_RANGE_LIMITED = 0x2,
+};
+
+static enum AVColorRange mcdec_get_color_range(int color_range)
+{
+    switch (color_range) {
+    case COLOR_RANGE_FULL:
+        return AVCOL_RANGE_JPEG;
+    case COLOR_RANGE_LIMITED:
+        return AVCOL_RANGE_MPEG;
+    default:
+        return AVCOL_RANGE_UNSPECIFIED;
+    }
+}
+
+enum {
+    COLOR_STANDARD_BT709      = 0x1,
+    COLOR_STANDARD_BT601_PAL  = 0x2,
+    COLOR_STANDARD_BT601_NTSC = 0x4,
+    COLOR_STANDARD_BT2020     = 0x6,
+};
+
+static enum AVColorSpace mcdec_get_color_space(int color_standard)
+{
+    switch (color_standard) {
+    case COLOR_STANDARD_BT709:
+        return AVCOL_SPC_BT709;
+    case COLOR_STANDARD_BT601_PAL:
+        return AVCOL_SPC_BT470BG;
+    case COLOR_STANDARD_BT601_NTSC:
+        return AVCOL_SPC_SMPTE170M;
+    case COLOR_STANDARD_BT2020:
+        return AVCOL_SPC_BT2020_NCL;
+    default:
+        return AVCOL_SPC_UNSPECIFIED;
+    }
+}
+
+static enum AVColorPrimaries mcdec_get_color_pri(int color_standard)
+{
+    switch (color_standard) {
+    case COLOR_STANDARD_BT709:
+        return AVCOL_PRI_BT709;
+    case COLOR_STANDARD_BT601_PAL:
+        return AVCOL_PRI_BT470BG;
+    case COLOR_STANDARD_BT601_NTSC:
+        return AVCOL_PRI_SMPTE170M;
+    case COLOR_STANDARD_BT2020:
+        return AVCOL_PRI_BT2020;
+    default:
+        return AVCOL_PRI_UNSPECIFIED;
+    }
+}
+
+enum {
+    COLOR_TRANSFER_LINEAR    = 0x1,
+    COLOR_TRANSFER_SDR_VIDEO = 0x3,
+    COLOR_TRANSFER_ST2084    = 0x6,
+    COLOR_TRANSFER_HLG       = 0x7,
+};
+
+static enum AVColorTransferCharacteristic mcdec_get_color_trc(int color_transfer)
+{
+    switch (color_transfer) {
+    case COLOR_TRANSFER_LINEAR:
+        return AVCOL_TRC_LINEAR;
+    case COLOR_TRANSFER_SDR_VIDEO:
+        return AVCOL_TRC_SMPTE170M;
+    case COLOR_TRANSFER_ST2084:
+        return AVCOL_TRC_SMPTEST2084;
+    case COLOR_TRANSFER_HLG:
+        return AVCOL_TRC_ARIB_STD_B67;
+    default:
+        return AVCOL_TRC_UNSPECIFIED;
+    }
+}
+
+enum {
     COLOR_FormatYUV420Planar                              = 0x13,
     COLOR_FormatYUV420SemiPlanar                          = 0x15,
     COLOR_FormatYCbYCr                                    = 0x19,
@@ -209,7 +288,7 @@ static int mediacodec_wrap_hw_buffer(AVCodecContext *avctx,
 
     if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
         frame->pts = av_rescale_q(info->presentationTimeUs,
-                                      av_make_q(1, 1000000),
+                                      AV_TIME_BASE_Q,
                                       avctx->pkt_timebase);
     } else {
         frame->pts = info->presentationTimeUs;
@@ -220,6 +299,10 @@ FF_DISABLE_DEPRECATION_WARNINGS
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
     frame->pkt_dts = AV_NOPTS_VALUE;
+    frame->color_range = avctx->color_range;
+    frame->color_primaries = avctx->color_primaries;
+    frame->color_trc = avctx->color_trc;
+    frame->colorspace = avctx->colorspace;
 
     buffer = av_mallocz(sizeof(AVMediaCodecBuffer));
     if (!buffer) {
@@ -298,7 +381,7 @@ static int mediacodec_wrap_sw_buffer(AVCodecContext *avctx,
      *   * 0-sized avpackets are pushed to flush remaining frames at EOS */
     if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
         frame->pts = av_rescale_q(info->presentationTimeUs,
-                                      av_make_q(1, 1000000),
+                                      AV_TIME_BASE_Q,
                                       avctx->pkt_timebase);
     } else {
         frame->pts = info->presentationTimeUs;
@@ -312,7 +395,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
     av_log(avctx, AV_LOG_TRACE,
             "Frame: width=%d stride=%d height=%d slice-height=%d "
-            "crop-top=%d crop-bottom=%d crop-left=%d crop-right=%d encoder=%s\n"
+            "crop-top=%d crop-bottom=%d crop-left=%d crop-right=%d encoder=%s "
             "destination linesizes=%d,%d,%d\n" ,
             avctx->width, s->stride, avctx->height, s->slice_height,
             s->crop_top, s->crop_bottom, s->crop_left, s->crop_right, s->codec_name,
@@ -368,6 +451,9 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
     int ret = 0;
     int width = 0;
     int height = 0;
+    int color_range = 0;
+    int color_standard = 0;
+    int color_transfer = 0;
     char *format = NULL;
 
     if (!s->format) {
@@ -389,13 +475,14 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
     s->stride = s->stride > 0 ? s->stride : s->width;
 
     AMEDIAFORMAT_GET_INT32(s->slice_height, "slice-height", 0);
-    s->slice_height = s->slice_height > 0 ? s->slice_height : s->height;
 
-    if (strstr(s->codec_name, "OMX.Nvidia.")) {
+    if (strstr(s->codec_name, "OMX.Nvidia.") && s->slice_height == 0) {
         s->slice_height = FFALIGN(s->height, 16);
     } else if (strstr(s->codec_name, "OMX.SEC.avc.dec")) {
         s->slice_height = avctx->height;
         s->stride = avctx->width;
+    } else if (s->slice_height == 0) {
+        s->slice_height = s->height;
     }
 
     AMEDIAFORMAT_GET_INT32(s->color_format, "color-format", 1);
@@ -425,6 +512,20 @@ static int mediacodec_dec_parse_format(AVCodecContext *avctx, MediaCodecDecConte
         ff_set_sar(avctx, sar);
     }
 
+    AMEDIAFORMAT_GET_INT32(color_range, "color-range", 0);
+    if (color_range)
+        avctx->color_range = mcdec_get_color_range(color_range);
+
+    AMEDIAFORMAT_GET_INT32(color_standard, "color-standard", 0);
+    if (color_standard) {
+        avctx->colorspace = mcdec_get_color_space(color_standard);
+        avctx->color_primaries = mcdec_get_color_pri(color_standard);
+    }
+
+    AMEDIAFORMAT_GET_INT32(color_transfer, "color-transfer", 0);
+    if (color_transfer)
+        avctx->color_trc = mcdec_get_color_trc(color_transfer);
+
     av_log(avctx, AV_LOG_INFO,
         "Output crop parameters top=%d bottom=%d left=%d right=%d, "
         "resulting dimensions width=%d height=%d\n",
@@ -450,6 +551,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
     s->eos = 0;
     atomic_fetch_add(&s->serial, 1);
     atomic_init(&s->hw_buffer_count, 0);
+    s->current_input_buffer = -1;
 
     status = ff_AMediaCodec_flush(codec);
     if (status < 0) {
@@ -477,6 +579,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     atomic_init(&s->refcount, 1);
     atomic_init(&s->hw_buffer_count, 0);
     atomic_init(&s->serial, 1);
+    s->current_input_buffer = -1;
 
     pix_fmt = ff_get_format(avctx, pix_fmts);
     if (pix_fmt == AV_PIX_FMT_MEDIACODEC) {
@@ -522,8 +625,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     if (status < 0) {
         char *desc = ff_AMediaFormat_toString(format);
         av_log(avctx, AV_LOG_ERROR,
-            "Failed to configure codec (status = %d) with format %s\n",
-            status, desc);
+            "Failed to configure codec %s (status = %d) with format %s\n",
+            s->codec_name, status, desc);
         av_freep(&desc);
 
         ret = AVERROR_EXTERNAL;
@@ -534,8 +637,8 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     if (status < 0) {
         char *desc = ff_AMediaFormat_toString(format);
         av_log(avctx, AV_LOG_ERROR,
-            "Failed to start codec (status = %d) with format %s\n",
-            status, desc);
+            "Failed to start codec %s (status = %d) with format %s\n",
+            s->codec_name, status, desc);
         av_freep(&desc);
         ret = AVERROR_EXTERNAL;
         goto fail;
@@ -561,16 +664,16 @@ fail:
 }
 
 int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
-                           AVPacket *pkt)
+                           AVPacket *pkt, bool wait)
 {
     int offset = 0;
     int need_draining = 0;
     uint8_t *data;
-    ssize_t index;
     size_t size;
     FFAMediaCodec *codec = s->codec;
     int status;
-    int64_t input_dequeue_timeout_us = INPUT_DEQUEUE_TIMEOUT_US;
+    int64_t input_dequeue_timeout_us = wait ? INPUT_DEQUEUE_TIMEOUT_US : 0;
+    int64_t pts;
 
     if (s->flushing) {
         av_log(avctx, AV_LOG_ERROR, "Decoder is flushing and cannot accept new buffer "
@@ -587,17 +690,20 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
     }
 
     while (offset < pkt->size || (need_draining && !s->draining)) {
-
-        index = ff_AMediaCodec_dequeueInputBuffer(codec, input_dequeue_timeout_us);
-        if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
-            av_log(avctx, AV_LOG_TRACE, "No input buffer available, try again later\n");
-            break;
-        }
-
+        ssize_t index = s->current_input_buffer;
         if (index < 0) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to dequeue input buffer (status=%zd)\n", index);
-            return AVERROR_EXTERNAL;
+            index = ff_AMediaCodec_dequeueInputBuffer(codec, input_dequeue_timeout_us);
+            if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
+                av_log(avctx, AV_LOG_TRACE, "No input buffer available, try again later\n");
+                break;
+            }
+
+            if (index < 0) {
+                av_log(avctx, AV_LOG_ERROR, "Failed to dequeue input buffer (status=%zd)\n", index);
+                return AVERROR_EXTERNAL;
+            }
         }
+        s->current_input_buffer = -1;
 
         data = ff_AMediaCodec_getInputBuffer(codec, index, &size);
         if (!data) {
@@ -605,13 +711,17 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             return AVERROR_EXTERNAL;
         }
 
-        if (need_draining) {
-            int64_t pts = pkt->pts;
-            uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
+        pts = pkt->pts;
+        if (pts == AV_NOPTS_VALUE) {
+            av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
+            pts = 0;
+        }
+        if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
+            pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
+        }
 
-            if (s->surface) {
-                pts = av_rescale_q(pts, avctx->pkt_timebase, av_make_q(1, 1000000));
-            }
+        if (need_draining) {
+            uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
 
             av_log(avctx, AV_LOG_DEBUG, "Sending End Of Stream signal\n");
 
@@ -622,30 +732,24 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             }
 
             av_log(avctx, AV_LOG_TRACE,
-                   "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
+                   "Queued empty EOS input buffer %zd with flags=%d\n", index, flags);
 
             s->draining = 1;
-            break;
-        } else {
-            int64_t pts = pkt->pts;
-
-            size = FFMIN(pkt->size - offset, size);
-            memcpy(data, pkt->data + offset, size);
-            offset += size;
-
-            if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
-                pts = av_rescale_q(pts, avctx->pkt_timebase, av_make_q(1, 1000000));
-            }
-
-            status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, size, pts, 0);
-            if (status < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
-                return AVERROR_EXTERNAL;
-            }
-
-            av_log(avctx, AV_LOG_TRACE,
-                   "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
+            return 0;
         }
+
+        size = FFMIN(pkt->size - offset, size);
+        memcpy(data, pkt->data + offset, size);
+        offset += size;
+
+        status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, size, pts, 0);
+        if (status < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
+            return AVERROR_EXTERNAL;
+        }
+
+        av_log(avctx, AV_LOG_TRACE,
+               "Queued input buffer %zd size=%zd ts=%"PRIi64"\n", index, size, pts);
     }
 
     if (offset == 0)
@@ -764,6 +868,18 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
     return AVERROR(EAGAIN);
 }
 
+/*
+* ff_mediacodec_dec_flush returns 0 if the flush cannot be performed on
+* the codec (because the user retains frames). The codec stays in the
+* flushing state.
+*
+* ff_mediacodec_dec_flush returns 1 if the flush can actually be
+* performed on the codec. The codec leaves the flushing state and can
+* process again packets.
+*
+* ff_mediacodec_dec_flush returns a negative value if an error has
+* occurred.
+*/
 int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)
 {
     if (!s->surface || atomic_load(&s->refcount) == 1) {
