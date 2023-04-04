@@ -371,11 +371,6 @@ typedef struct RcOverride{
 #define AV_CODEC_FLAG2_IGNORE_CROP    (1 << 16)
 
 /**
- * Produce fake audio silence frame after drainning done.
- */
-#define AV_CODEC_FLAG2_DRAIN_SILENCE    (1 << 18)
-
-/**
  * Show all frames before the first keyframe
  */
 #define AV_CODEC_FLAG2_SHOW_ALL       (1 << 22)
@@ -717,10 +712,75 @@ typedef struct AVCodecContext {
      * Bitstream width / height, may be different from width/height e.g. when
      * the decoded frame is cropped before being output or lowres is enabled.
      *
+     * @note Those field may not match the value of the last
+     * AVFrame output by avcodec_receive_frame() due frame
+     * reordering.
+     *
+     * - encoding: unused
+     * - decoding: May be set by the user before opening the decoder if known
+     *             e.g. from the container. During decoding, the decoder may
+     *             overwrite those values as required while parsing the data.
+     */
+    int coded_width, coded_height;
+
+    /**
+     * the number of pictures in a group of pictures, or 0 for intra_only
+     * - encoding: Set by user.
+     * - decoding: unused
+     */
+    int gop_size;
+
+    /**
+     * Pixel format, see AV_PIX_FMT_xxx.
+     * May be set by the demuxer if known from headers.
+     * May be overridden by the decoder if it knows better.
+     *
+     * @note This field may not match the value of the last
+     * AVFrame output by avcodec_receive_frame() due frame
+     * reordering.
+     *
+     * - encoding: Set by user.
+     * - decoding: Set by user if known, overridden by libavcodec while
+     *             parsing the data.
+     */
+    enum AVPixelFormat pix_fmt;
+
+    /**
+     * If non NULL, 'draw_horiz_band' is called by the libavcodec
+     * decoder to draw a horizontal band. It improves cache usage. Not
+     * all codecs can do that. You must check the codec capabilities
+     * beforehand.
+     * When multithreading is used, it may be called from multiple threads
+     * at the same time; threads might draw different parts of the same AVFrame,
+     * or multiple AVFrames, and there is no guarantee that slices will be drawn
+     * in order.
+     * The function is also used by hardware acceleration APIs.
+     * It is called at least once during frame decoding to pass
+     * the data needed for hardware render.
+     * In that mode instead of pixel data, AVFrame points to
+     * a structure specific to the acceleration API. The application
+     * reads the structure and can change some fields to indicate progress
+     * or mark state.
+     * - encoding: unused
+     * - decoding: Set by user.
+     * @param height the height of the slice
+     * @param y the y position of the slice
+     * @param type 1->top field, 2->bottom field, 3->frame
+     * @param offset offset into the AVFrame.data from which the slice should be read
+     */
+    void (*draw_horiz_band)(struct AVCodecContext *s,
+                            const AVFrame *src, int offset[AV_NUM_DATA_POINTERS],
+                            int y, int type, int height);
+
+    /**
+     * callback to negotiate the pixelFormat
+     * @param fmt is the list of formats which are supported by the codec,
+     * it is terminated by -1 as 0 is a valid format, the formats are ordered by quality.
      * The first is always the native one.
      * @note The callback may be called again immediately if initialization for
      * the selected (hardware-accelerated) pixel format failed.
      * @warning Behavior is undefined if the callback returns a value not
+     * in the fmt list of formats.
      * @return the chosen format
      * - encoding: unused
      * - decoding: Set by user, if not set the native format will be chosen.

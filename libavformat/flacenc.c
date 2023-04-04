@@ -88,7 +88,11 @@ static int flac_write_picture(struct AVFormatContext *s, AVPacket *pkt)
     int i, mimelen, desclen, type = 0, blocklen;
 
     if (!pkt->data)
+        return 0;
+
+    while (mime->id != AV_CODEC_ID_NONE) {
         if (mime->id == st->codecpar->codec_id) {
+            mimetype = mime->str;
             break;
         }
         mime++;

@@ -4,14 +4,6 @@ DESC = FFmpeg container format library
 HEADERS = avformat.h                                                    \
           avio.h                                                        \
           version.h                                                     \
-          avc.h                                                         \
-          url.h                                                         \
-          internal.h                                                    \
-          avio_internal.h                                               \
-          flv.h                                                         \
-          id3v2.h                                                       \
-          os_support.h                                                  \
-          metadata.h                                                  \
 
 OBJS = allformats.o         \
        avio.o               \
@@ -29,8 +21,6 @@ OBJS = allformats.o         \
        sdp.o                \
        url.o                \
        utils.o              \
-       avc.o                \
-       ijkutils.o           \
 
 OBJS-$(HAVE_LIBC_MSVCRT)                 += file_open.o
 
