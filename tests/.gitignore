@@ -1,11 +1,4 @@
-/audiogen
-/audiomatch
-/base64
-/data/
-/pixfmts.mak
-/rotozoom
-/test_copy.ffmeta
-/tiny_psnr
-/tiny_ssim
-/videogen
-/vsynth1/
+/colorspace
+/floatimg_cmp
+/pixdesc_query
+/swscale
